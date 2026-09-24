@@ -247,3 +247,21 @@ resource "kubernetes_service" "sample_app_svc" {
     type = "LoadBalancer"
   }
 }
+# ------------------------------------------------------------------------------
+# 5. Post-Deployment Verification (Dedicated Null Resource)
+# ------------------------------------------------------------------------------
+resource "null_resource" "verify_deployment" {
+  # Waits for the service and deployment to finish provisioning first
+  depends_on = [
+    kubernetes_service.sample_app_svc,
+    kubernetes_deployment.sample_app
+  ]
+
+  provisioner "local-exec" {
+    command = <<EOT
+      aws eks update-kubeconfig --region ${var.region} --name ${module.eks.cluster_name}
+      kubectl get nodes
+      kubectl get pods -n sample-app
+    EOT
+  }
+}
