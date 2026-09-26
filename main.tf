@@ -1,28 +1,3 @@
-terraform {
-  required_version = ">= 1.5.0"
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
-    }
-    kubernetes = {
-      source  = "hashicorp/kubernetes"
-      version = "~> 2.25"
-    }
-  }
-}
-
-provider "aws" {
-  region = var.region
-
-  default_tags {
-    tags = {
-      Environment = var.environment
-      ManagedBy   = "Terraform"
-    }
-  }
-}
-
 # ------------------------------------------------------------------------------
 # 1. VPC Architecture for EKS Production
 # ------------------------------------------------------------------------------
@@ -67,7 +42,7 @@ module "eks" {
   version = "~> 20.0"
 
   cluster_name    = var.cluster_name
-  cluster_version = "1.30"
+  cluster_version = "1.32"
 # Enable EKS API Access Entries
   enable_cluster_creator_admin_permissions = true
   authentication_mode                      = "API_AND_CONFIG_MAP"
@@ -114,7 +89,11 @@ module "eks" {
       desired_size = 3
 
       capacity_type = "ON_DEMAND"
-      
+      # Label to identify 1.31 nodes in kubectl
+      labels = {
+        "node-version" = "1.31"
+      }
+
       # Ensure EBS volumes are encrypted
       block_device_mappings = {
         xvda = {
@@ -132,9 +111,48 @@ module "eks" {
         AmazonEBSCSIDriverPolicy = "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"
       }
     }
+    /* LATEST NODE GROUP (v1.32) - Uncomment when ready to migrate workloads
+    # --------------------------------------------------------------------------
+    # 2. ADD THIS: Canary Node Group (v1.32) - For testing/workload migration
+    # --------------------------------------------------------------------------
+    canary_1_32 = {
+      name           = "canary-node-group-1-32"
+      instance_types = ["m6i.large", "m5.large"]
+      ami_type       = "AL2023_x86_64_STANDARD"
+
+      # Start with a small size for initial verification
+      min_size     = 1
+      max_size     = 5
+      desired_size = 1
+
+      capacity_type = "ON_DEMAND"
+
+      # Label to target pods specifically to 1.32 nodes during canary testing
+      labels = {
+        "node-version" = "1.32"
+      }
+
+      # Match volume configuration
+      block_device_mappings = {
+        xvda = {
+          device_name = "/dev/xvda"
+          ebs = {
+            volume_size           = 100
+            volume_type           = "gp3"
+            encrypted             = true
+            delete_on_termination = true
+          }
+        }
+      }
+
+      iam_role_additional_policies = {
+        AmazonEBSCSIDriverPolicy = "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"
+      }
+    }*/
   }
 }
 
+/*
 # ------------------------------------------------------------------------------
 # 3. Kubernetes Provider Authentication
 # ------------------------------------------------------------------------------
@@ -149,7 +167,7 @@ provider "kubernetes" {
   cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
   token                  = data.aws_eks_cluster_auth.cluster.token
 }
-
+*/
 # ------------------------------------------------------------------------------
 # 4. Sample Workload Deployment (Nginx / App)
 # ------------------------------------------------------------------------------
@@ -247,7 +265,7 @@ resource "kubernetes_service" "sample_app_svc" {
     type = "LoadBalancer"
   }
 }
-# ------------------------------------------------------------------------------
+/*# ------------------------------------------------------------------------------
 # 5. Post-Deployment Verification (Dedicated Null Resource)
 # ------------------------------------------------------------------------------
 resource "null_resource" "verify_deployment" {
@@ -264,4 +282,112 @@ resource "null_resource" "verify_deployment" {
       kubectl get pods -n sample-app
     EOT
   }
+}*/
+# ------------------------------------------------------------------------------
+# Velero S3 Backup Bucket
+# ------------------------------------------------------------------------------
+resource "aws_s3_bucket" "velero_backups" {
+  bucket        = "${var.cluster_name}-velero-backups-${var.environment}"
+  force_destroy = false
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "velero_s3_encryption" {
+  bucket = aws_s3_bucket.velero_backups.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+# ------------------------------------------------------------------------------
+# IAM Role for Service Accounts (IRSA) - Velero
+# ------------------------------------------------------------------------------
+module "velero_irsa_role" {
+  source  = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks"
+  version = "~> 5.0"
+
+  role_name                     = "${var.cluster_name}-velero-irsa"
+  attach_velero_policy          = true
+  velero_s3_bucket_arns         = [aws_s3_bucket.velero_backups.arn]
+
+  oidc_providers = {
+    main = {
+      provider_arn               = module.eks.oidc_provider_arn
+      namespace_service_accounts = ["velero:velero"]
+    }
+  }
+}
+# ------------------------------------------------------------------------------
+# Velero Helm Chart Deployment
+# ------------------------------------------------------------------------------
+resource "kubernetes_namespace" "velero" {
+  depends_on = [module.eks]
+
+  metadata {
+    name = "velero"
+  }
+}
+
+resource "helm_release" "velero" {
+  name             = "velero"
+  repository       = "https://vmware-tanzu.github.io/helm-charts"
+  chart            = "velero"
+  namespace        = "velero"
+  create_namespace = true
+
+  values = [
+    yamlencode({
+      configuration = {
+        # Define provider under backupStorageLocation
+        backupStorageLocation = [
+          {
+            name     = "default"
+            provider = "aws"
+            bucket   = aws_s3_bucket.velero_backups.id
+            config = {
+              region = var.region
+            }
+          }
+        ]
+
+        # Define provider under volumeSnapshotLocation
+        volumeSnapshotLocation = [
+          {
+            name     = "default"
+            provider = "aws"
+            config = {
+              region = var.region
+            }
+          }
+        ]
+      }
+
+      # AWS Plugin requirement
+      initContainers = [
+        {
+          name  = "velero-plugin-for-aws"
+          image = "velero/velero-plugin-for-aws:v1.9.0"
+          volumeMounts = [
+            {
+              mountPath = "/target"
+              name      = "plugins"
+            }
+          ]
+        }
+      ]
+
+      # IRSA Integration
+      serviceAccount = {
+        server = {
+          create = true
+          name   = "velero"
+          annotations = {
+            "eks.amazonaws.com/role-arn" = module.velero_irsa_role.iam_role_arn
+          }
+        }
+      }
+    })
+  ]
 }

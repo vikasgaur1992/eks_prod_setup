@@ -1,0 +1,109 @@
+# Local Variables
+locals {
+  cluster_name = "prod-eks-cluster"
+  environment  = "production"
+  region       = "us-east-1"
+}
+
+# ------------------------------------------------------------------------------
+# 1. Dedicated KMS Customer Managed Key (CMK) for Envelope Encryption
+# ------------------------------------------------------------------------------
+resource "aws_kms_key" "eks_secrets" {
+  description             = "KMS CMK for EKS Cluster Secrets Envelope Encryption (${local.cluster_name})"
+  deletion_window_in_days = 30
+  enable_key_rotation     = true
+
+  tags = {
+    Environment = local.environment
+    ManagedBy   = "Terraform"
+  }
+}
+
+resource "aws_kms_alias" "eks_secrets" {
+  name          = "alias/${local.cluster_name}-secrets"
+  target_key_id = aws_kms_key.eks_secrets.key_id
+}
+
+# ------------------------------------------------------------------------------
+# 2. Production EKS Cluster
+# ------------------------------------------------------------------------------
+module "eks" {
+  source  = "terraform-aws-modules/eks/aws"
+  version = "~> 20.0"
+
+  cluster_name    = local.cluster_name
+  cluster_version = "1.32"
+
+  # Networking & Endpoint Security
+  vpc_id                   = module.vpc.vpc_id
+  subnet_ids               = module.vpc.private_subnets
+  control_plane_subnet_ids = module.vpc.private_subnets
+
+  # Lock down API Endpoint Access to Private Only
+  cluster_endpoint_public_access  = false
+  cluster_endpoint_private_access = true
+
+  # ----------------------------------------------------------------------------
+  # Control Plane Logging & KMS Secrets Encryption
+  # ----------------------------------------------------------------------------
+  # Enable all 5 CloudWatch Control Plane log types
+  cluster_enabled_log_types = [
+    "api",
+    "audit",
+    "authenticator",
+    "controllerManager",
+    "scheduler"
+  ]
+
+  # KMS Envelope Encryption for Kubernetes Secrets
+  create_kms_key = false # Use explicitly defined CMK above
+  cluster_encryption_config = {
+    provider_key_arn = aws_kms_key.eks_secrets.arn
+    resources        = ["secrets"]
+  }
+
+  # Enable OIDC Provider for IRSA
+  enable_irsa = true
+
+  # ----------------------------------------------------------------------------
+  # Managed Node Groups (Bottlerocket / AL2023 Hardened Defaults)
+  # ----------------------------------------------------------------------------
+  eks_managed_node_group_defaults = {
+    ami_type       = "AL2023_x86_64_STANDARD"
+    instance_types = ["m6i.large", "m5.large"]
+
+    # Enforce IMDSv2 Hop Limit = 1 to prevent Pods from stealing Node Metadata
+    metadata_options = {
+      http_endpoint               = "enabled"
+      http_tokens                 = "required"
+      http_put_response_hop_limit = 1
+    }
+
+    # Restrict Nodes exclusively to Private Subnets
+    subnet_ids = module.vpc.private_subnets
+  }
+
+  eks_managed_node_groups = {
+    general = {
+      name           = "general-ng"
+      min_size       = 3
+      max_size       = 6
+      desired_size   = 3
+      capacity_type  = "ON_DEMAND"
+
+      labels = {
+        role = "general"
+      }
+    }
+  }
+
+  # Security Group Hardening
+  node_security_group_tags = {
+    "k8s.io/cluster-autoscaler/node-template/label/role" = "general"
+  }
+
+  tags = {
+    Environment = local.environment
+    ManagedBy   = "Terraform"
+  }
+}

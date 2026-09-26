@@ -1,0 +1,31 @@
+# values.yaml
+credentials:
+  useSecret: false
+
+serviceAccount:
+  server:
+    create: true
+    name: velero
+    annotations:
+      eks.amazonaws.com/role-arn: "arn:aws:iam::593750893557:role/prod-eks-cluster-velero-irsa"
+
+configuration:
+  backupStorageLocation:
+    - name: default
+      provider: aws
+      bucket: prod-eks-cluster-velero-backups-prod
+      config:
+        region: us-east-1
+  volumeSnapshotLocation:
+    - name: default
+      provider: aws
+      config:
+        region: us-east-1
+
+initContainers:
+  - name: velero-plugin-for-aws
+    image: velero/velero-plugin-for-aws:v1.11.0
+    imagePullPolicy: IfNotPresent
+    volumeMounts:
+      - mountPath: /target
+        name: plugins

@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: change-storage-class-config
+  namespace: velero
+  labels:
+    velero.io/plugin-config: ""
+    velero.io/change-storage-class: RestoreItemAction
+data:
+  # Format: <old-storage-class>: <new-storage-class>
+  gp2: gp3
+  gp2-csi: efs-sc
